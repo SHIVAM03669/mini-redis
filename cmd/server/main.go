@@ -19,6 +19,7 @@ import (
 
 // Global cache instance shared across all HTTP handlers
 var cacheInstance *cache.Cache
+var snapshotManager *cache.SnapshotManager
 
 // SetRequest represents the JSON payload for the /set endpoint
 type SetRequest struct {
@@ -35,10 +36,14 @@ type DelRequest struct {
 // main initializes the cache server and starts the HTTP server.
 // It also launches a background goroutine that periodically cleans up expired keys.
 func main() {
-	// Determine AOF file path (default: data/appendonly.aof)
+	// Determine file paths (defaults)
 	aofPath := "data/appendonly.aof"
+	snapshotPath := "data/dump.rdb"
 	if len(os.Args) > 1 {
 		aofPath = os.Args[1]
+	}
+	if len(os.Args) > 2 {
+		snapshotPath = os.Args[2]
 	}
 
 	// Ensure the directory exists
@@ -46,15 +51,25 @@ func main() {
 		log.Fatalf("Failed to create data directory: %v", err)
 	}
 
-	// Initialize cache with AOF persistence
+	// Initialize cache with AOF persistence and snapshot support
 	var err error
-	cacheInstance, err = cache.NewCache(aofPath)
+	cacheInstance, err = cache.NewCache(aofPath, snapshotPath)
 	if err != nil {
 		log.Fatalf("Failed to initialize cache: %v", err)
 	}
 	defer cacheInstance.Close()
 
-	fmt.Printf("Cache initialized with AOF: %s\n", aofPath)
+	fmt.Printf("Cache initialized with AOF: %s, Snapshot: %s\n", aofPath, snapshotPath)
+
+	// Start snapshot manager (creates snapshots every 5 minutes and clears AOF)
+	snapshotInterval := 5 * time.Minute
+	snapshotManager = cache.NewSnapshotManager(cacheInstance, snapshotPath, snapshotInterval)
+	if err := snapshotManager.Start(); err != nil {
+		log.Fatalf("Failed to start snapshot manager: %v", err)
+	}
+	defer snapshotManager.Stop()
+
+	fmt.Printf("Snapshot manager started (interval: %v)\n", snapshotInterval)
 
 	// Start background cleaner goroutine that runs every second
 	// This proactively removes expired keys, simulating real cache behavior
@@ -72,6 +87,7 @@ func main() {
 	go func() {
 		<-sigChan
 		fmt.Println("\nShutting down gracefully...")
+		snapshotManager.Stop()
 		if err := cacheInstance.Close(); err != nil {
 			log.Printf("Error closing cache: %v", err)
 		}

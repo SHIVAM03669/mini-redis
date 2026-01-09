@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -8,18 +9,28 @@ import (
 // Cache represents an in-memory key-value store with expiration support.
 // It uses a read-write mutex for thread-safe concurrent access.
 type Cache struct {
-	data    map[string]string   // Main storage: key -> value mapping
-	expires map[string]time.Time // Expiration tracking: key -> expiration time
-	mu      sync.RWMutex         // Read-write mutex for thread-safe operations
-	aof     *AOF                 // Append-only file for persistence
+	data           map[string]string   // Main storage: key -> value mapping
+	expires        map[string]time.Time // Expiration tracking: key -> expiration time
+	mu             sync.RWMutex         // Read-write mutex for thread-safe operations
+	aof            *AOF                 // Append-only file for persistence
+	snapshotManager *SnapshotManager   // Snapshot manager for periodic snapshots
 }
 
 // NewCache creates and returns a new Cache instance with initialized maps.
-// It also initializes the AOF persistence layer.
-func NewCache(aofPath string) (*Cache, error) {
+// It also initializes the AOF persistence layer and loads snapshot if available.
+func NewCache(aofPath, snapshotPath string) (*Cache, error) {
 	c := &Cache{
 		data:    make(map[string]string),
 		expires: make(map[string]time.Time),
+	}
+
+	// Load snapshot first (if it exists)
+	loaded, err := c.LoadSnapshot(snapshotPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load snapshot: %w", err)
+	}
+	if loaded {
+		fmt.Printf("Loaded snapshot from %s\n", snapshotPath)
 	}
 
 	// Initialize AOF
@@ -29,7 +40,7 @@ func NewCache(aofPath string) (*Cache, error) {
 	}
 	c.aof = aof
 
-	// Replay AOF to restore data
+	// Replay AOF to restore any operations after snapshot
 	if err := aof.Replay(); err != nil {
 		return nil, err
 	}
