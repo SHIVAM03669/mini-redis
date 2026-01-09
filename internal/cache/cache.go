@@ -72,8 +72,12 @@ func (c *Cache) Set(key, value string, ttl time.Duration) {
 	// Check if this is an update to an existing key
 	isNewKey := !c.hasKey(key)
 
+	// Clean up expired keys first to ensure accurate count
+	c.cleanupExpiredLocked()
+
 	// If we're at the limit and this is a new key, evict the least recently used key
-	if c.maxKeys > 0 && isNewKey && len(c.data) >= c.maxKeys {
+	// Only count valid (non-expired) keys
+	if c.maxKeys > 0 && isNewKey && c.countValidKeys() >= c.maxKeys {
 		c.evictLRU()
 	}
 
@@ -103,19 +107,63 @@ func (c *Cache) hasKey(key string) bool {
 	return exists
 }
 
+// isExpired checks if a key is expired (must be called with lock held).
+func (c *Cache) isExpired(key string) bool {
+	expiresAt, hasExpiry := c.expires[key]
+	if !hasExpiry {
+		return false // No expiration set
+	}
+	if expiresAt.IsZero() {
+		return false // Zero time means no expiry
+	}
+	return time.Now().After(expiresAt)
+}
+
+// countValidKeys returns the number of non-expired keys in the cache (must be called with lock held).
+func (c *Cache) countValidKeys() int {
+	if len(c.data) == 0 {
+		return 0
+	}
+	
+	now := time.Now()
+	count := 0
+	for key := range c.data {
+		expiresAt, hasExpiry := c.expires[key]
+		if !hasExpiry {
+			count++ // No expiration, key is valid
+			continue
+		}
+		if expiresAt.IsZero() {
+			count++ // Zero time means no expiry, key is valid
+			continue
+		}
+		if !now.After(expiresAt) {
+			count++ // Not expired yet, key is valid
+		}
+	}
+	return count
+}
+
 // evictLRU removes the least recently used key from the cache (LRU eviction).
+// Only considers valid (non-expired) keys for eviction.
 // Must be called with lock held.
 func (c *Cache) evictLRU() {
 	if len(c.lastAccess) == 0 {
 		return // Nothing to evict
 	}
 
-	// Find the key with the oldest access time
+	// Find the valid (non-expired) key with the oldest access time
 	var lruKey string
 	var oldestTime time.Time
 	first := true
 
 	for key, accessTime := range c.lastAccess {
+		// Skip expired keys - they should not affect LRU order
+		if c.isExpired(key) {
+			continue
+		}
+
+		// Only consider valid keys for LRU eviction
 		if first || accessTime.Before(oldestTime) {
 			lruKey = key
 			oldestTime = accessTime
@@ -124,7 +172,7 @@ func (c *Cache) evictLRU() {
 	}
 
 	if lruKey == "" {
-		return // No key found to evict
+		return // No valid key found to evict
 	}
 
 	// Remove from all maps
@@ -189,19 +237,16 @@ func (c *Cache) Del(key string) {
 	}
 }
 
-// cleanup scans the cache and removes all expired keys.
-// This method is called periodically by the background goroutine.
-// Keys with zero expiration time (no expiry) are never removed.
-func (c *Cache) Cleanup() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+// cleanupExpiredLocked removes expired keys from the cache.
+// Must be called with lock held.
+func (c *Cache) cleanupExpiredLocked() {
 	now := time.Now()
 	for key, expiresAt := range c.expires {
 		// Only check keys with non-zero expiration time
 		// Zero time means the key never expires
 		if !expiresAt.IsZero() && now.After(expiresAt) {
-			// Key has expired - remove it from all maps
+			// Key has expired - remove it from all maps immediately
+			// This ensures expired keys don't affect LRU order
 			delete(c.data, key)
 			delete(c.expires, key)
 			delete(c.lastAccess, key)
@@ -209,13 +254,27 @@ func (c *Cache) Cleanup() {
 	}
 }
 
+// Cleanup scans the cache and removes all expired keys.
+// This method is called periodically by the background goroutine.
+// Keys with zero expiration time (no expiry) are never removed.
+// Expired keys are removed immediately to prevent them from affecting LRU order.
+func (c *Cache) Cleanup() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanupExpiredLocked()
+}
+
 // setInternal is used by AOF replay to set values without logging to AOF.
 // This prevents infinite loops during replay.
 func (c *Cache) setInternal(key, value string, ttl time.Duration) {
 	isNewKey := !c.hasKey(key)
 	
+	// Clean up expired keys first
+	c.cleanupExpiredLocked()
+	
 	// If we're at the limit and this is a new key, evict the least recently used key
-	if c.maxKeys > 0 && isNewKey && len(c.data) >= c.maxKeys {
+	// Only count valid (non-expired) keys
+	if c.maxKeys > 0 && isNewKey && c.countValidKeys() >= c.maxKeys {
 		c.evictLRU()
 	}
 
