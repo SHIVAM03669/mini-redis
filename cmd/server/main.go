@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -35,15 +36,39 @@ type DelRequest struct {
 
 // main initializes the cache server and starts the HTTP server.
 // It also launches a background goroutine that periodically cleans up expired keys.
+// Command-line arguments:
+//   [1] aofPath (default: "data/appendonly.aof")
+//   [2] snapshotPath (default: "data/dump.rdb")
+//   [3] maxKeys (default: 0 = unlimited, or set via MAX_KEYS env var)
 func main() {
 	// Determine file paths (defaults)
 	aofPath := "data/appendonly.aof"
 	snapshotPath := "data/dump.rdb"
+	maxKeys := 0
+
 	if len(os.Args) > 1 {
 		aofPath = os.Args[1]
 	}
 	if len(os.Args) > 2 {
 		snapshotPath = os.Args[2]
+	}
+	if len(os.Args) > 3 {
+		if val, err := strconv.Atoi(os.Args[3]); err == nil {
+			maxKeys = val
+		} else {
+			log.Fatalf("Invalid maxKeys value: %s (must be a positive integer or 0 for unlimited)", os.Args[3])
+		}
+	} else {
+		// Check environment variable
+		if envMaxKeys := os.Getenv("MAX_KEYS"); envMaxKeys != "" {
+			if val, err := strconv.Atoi(envMaxKeys); err == nil {
+				maxKeys = val
+			}
+		}
+	}
+
+	if maxKeys < 0 {
+		log.Fatalf("maxKeys must be >= 0 (0 = unlimited)")
 	}
 
 	// Ensure the directory exists
@@ -53,13 +78,17 @@ func main() {
 
 	// Initialize cache with AOF persistence and snapshot support
 	var err error
-	cacheInstance, err = cache.NewCache(aofPath, snapshotPath)
+	cacheInstance, err = cache.NewCache(aofPath, snapshotPath, maxKeys)
 	if err != nil {
 		log.Fatalf("Failed to initialize cache: %v", err)
 	}
 	defer cacheInstance.Close()
 
-	fmt.Printf("Cache initialized with AOF: %s, Snapshot: %s\n", aofPath, snapshotPath)
+	if maxKeys > 0 {
+		fmt.Printf("Cache initialized with AOF: %s, Snapshot: %s, MaxKeys: %d\n", aofPath, snapshotPath, maxKeys)
+	} else {
+		fmt.Printf("Cache initialized with AOF: %s, Snapshot: %s, MaxKeys: unlimited\n", aofPath, snapshotPath)
+	}
 
 	// Start snapshot manager (creates snapshots every 5 minutes and clears AOF)
 	snapshotInterval := 5 * time.Minute

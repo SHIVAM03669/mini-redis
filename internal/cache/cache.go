@@ -9,19 +9,24 @@ import (
 // Cache represents an in-memory key-value store with expiration support.
 // It uses a read-write mutex for thread-safe concurrent access.
 type Cache struct {
-	data           map[string]string   // Main storage: key -> value mapping
-	expires        map[string]time.Time // Expiration tracking: key -> expiration time
-	mu             sync.RWMutex         // Read-write mutex for thread-safe operations
-	aof            *AOF                 // Append-only file for persistence
+	data            map[string]string   // Main storage: key -> value mapping
+	expires         map[string]time.Time // Expiration tracking: key -> expiration time
+	keyOrder        []string            // FIFO queue for tracking key insertion order (for eviction)
+	mu              sync.RWMutex         // Read-write mutex for thread-safe operations
+	aof             *AOF                 // Append-only file for persistence
 	snapshotManager *SnapshotManager   // Snapshot manager for periodic snapshots
+	maxKeys         int                 // Maximum number of keys allowed (0 = unlimited)
 }
 
 // NewCache creates and returns a new Cache instance with initialized maps.
 // It also initializes the AOF persistence layer and loads snapshot if available.
-func NewCache(aofPath, snapshotPath string) (*Cache, error) {
+// maxKeys: Maximum number of keys allowed (0 = unlimited). When limit is reached, oldest keys are evicted.
+func NewCache(aofPath, snapshotPath string, maxKeys int) (*Cache, error) {
 	c := &Cache{
-		data:    make(map[string]string),
-		expires: make(map[string]time.Time),
+		data:     make(map[string]string),
+		expires:  make(map[string]time.Time),
+		keyOrder: make([]string, 0),
+		maxKeys:  maxKeys,
 	}
 
 	// Load snapshot first (if it exists)
@@ -59,9 +64,19 @@ func (c *Cache) Close() error {
 // Set stores a key-value pair in the cache.
 // If ttl > 0, the key will expire after the specified duration.
 // If ttl == 0, the key will never expire (zero time is used as a marker).
+// If maxKeys is set and limit is reached, the oldest key is evicted (FIFO).
 func (c *Cache) Set(key, value string, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Check if this is an update to an existing key
+	isNewKey := !c.hasKey(key)
+
+	// If we're at the limit and this is a new key, evict the oldest key
+	if c.maxKeys > 0 && isNewKey && len(c.data) >= c.maxKeys {
+		c.evictOldest()
+	}
+
 	c.data[key] = value
 
 	if ttl > 0 {
@@ -72,9 +87,43 @@ func (c *Cache) Set(key, value string, ttl time.Duration) {
 		c.expires[key] = time.Time{}
 	}
 
+	// Add to key order queue if it's a new key
+	if isNewKey {
+		c.keyOrder = append(c.keyOrder, key)
+	}
+
 	// Log to AOF
 	if c.aof != nil {
 		c.aof.LogSet(key, value, ttl)
+	}
+}
+
+// hasKey checks if a key exists in the cache (must be called with lock held).
+func (c *Cache) hasKey(key string) bool {
+	_, exists := c.data[key]
+	return exists
+}
+
+// evictOldest removes the oldest key from the cache (FIFO eviction).
+// Must be called with lock held.
+func (c *Cache) evictOldest() {
+	if len(c.keyOrder) == 0 {
+		return // Nothing to evict
+	}
+
+	// Get the oldest key (first in queue)
+	oldestKey := c.keyOrder[0]
+	
+	// Remove from key order queue
+	c.keyOrder = c.keyOrder[1:]
+
+	// Remove from data and expires maps
+	delete(c.data, oldestKey)
+	delete(c.expires, oldestKey)
+
+	// Log deletion to AOF
+	if c.aof != nil {
+		c.aof.LogDel(oldestKey)
 	}
 }
 
@@ -97,9 +146,10 @@ func (c *Cache) Get(key string) (string, bool) {
 	if hasExpiry && !expiresAt.IsZero() {
 		// Key has an expiration time set, check if it's expired
 		if time.Now().After(expiresAt) {
-			// Key expired - delete it from both maps
+			// Key expired - delete it from both maps and key order
 			delete(c.data, key)
 			delete(c.expires, key)
+			c.removeFromKeyOrder(key)
 			return "", false
 		}
 	}
@@ -112,12 +162,29 @@ func (c *Cache) Get(key string) (string, bool) {
 func (c *Cache) Del(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	
+	// Remove from maps
 	delete(c.data, key)
 	delete(c.expires, key)
+
+	// Remove from key order queue
+	c.removeFromKeyOrder(key)
 
 	// Log to AOF
 	if c.aof != nil {
 		c.aof.LogDel(key)
+	}
+}
+
+// removeFromKeyOrder removes a key from the key order queue.
+// Must be called with lock held.
+func (c *Cache) removeFromKeyOrder(key string) {
+	for i, k := range c.keyOrder {
+		if k == key {
+			// Remove element at index i
+			c.keyOrder = append(c.keyOrder[:i], c.keyOrder[i+1:]...)
+			return
+		}
 	}
 }
 
@@ -133,9 +200,10 @@ func (c *Cache) Cleanup() {
 		// Only check keys with non-zero expiration time
 		// Zero time means the key never expires
 		if !expiresAt.IsZero() && now.After(expiresAt) {
-			// Key has expired - remove it from both maps
+			// Key has expired - remove it from both maps and key order
 			delete(c.data, key)
 			delete(c.expires, key)
+			c.removeFromKeyOrder(key)
 		}
 	}
 }
@@ -143,6 +211,13 @@ func (c *Cache) Cleanup() {
 // setInternal is used by AOF replay to set values without logging to AOF.
 // This prevents infinite loops during replay.
 func (c *Cache) setInternal(key, value string, ttl time.Duration) {
+	isNewKey := !c.hasKey(key)
+	
+	// If we're at the limit and this is a new key, evict the oldest key
+	if c.maxKeys > 0 && isNewKey && len(c.data) >= c.maxKeys {
+		c.evictOldest()
+	}
+
 	c.data[key] = value
 
 	if ttl > 0 {
@@ -150,10 +225,16 @@ func (c *Cache) setInternal(key, value string, ttl time.Duration) {
 	} else {
 		c.expires[key] = time.Time{}
 	}
+
+	// Add to key order queue if it's a new key
+	if isNewKey {
+		c.keyOrder = append(c.keyOrder, key)
+	}
 }
 
 // delInternal is used by AOF replay to delete values without logging to AOF.
 func (c *Cache) delInternal(key string) {
 	delete(c.data, key)
 	delete(c.expires, key)
+	c.removeFromKeyOrder(key)
 }
