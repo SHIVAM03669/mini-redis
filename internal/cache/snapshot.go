@@ -103,6 +103,16 @@ func (c *Cache) LoadSnapshot(snapshotPath string) (bool, error) {
 		return false, nil // No snapshot exists, that's okay
 	}
 
+	// Check if file is empty
+	fileInfo, err := os.Stat(snapshotPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to stat snapshot file: %w", err)
+	}
+	if fileInfo.Size() == 0 {
+		// Empty file, treat as no snapshot
+		return false, nil
+	}
+
 	// Open snapshot file
 	file, err := os.Open(snapshotPath)
 	if err != nil {
@@ -114,7 +124,9 @@ func (c *Cache) LoadSnapshot(snapshotPath string) (bool, error) {
 	var snapshot Snapshot
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&snapshot); err != nil {
-		return false, fmt.Errorf("failed to decode snapshot: %w", err)
+		// If file is empty or corrupted, treat as no snapshot (don't fail startup)
+		// This can happen if a previous snapshot write was interrupted
+		return false, nil
 	}
 
 	// Restore cache state (without logging to AOF)
