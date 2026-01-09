@@ -136,7 +136,7 @@ func (c *Cache) LoadSnapshot(snapshotPath string) (bool, error) {
 	// Clear existing data
 	c.data = make(map[string]string)
 	c.expires = make(map[string]time.Time)
-	c.keyOrder = make([]string, 0)
+	c.lastAccess = make(map[string]time.Time)
 
 	// Restore entries
 	now := time.Now()
@@ -154,8 +154,8 @@ func (c *Cache) LoadSnapshot(snapshotPath string) (bool, error) {
 			c.expires[entry.Key] = time.Time{} // No expiration
 		}
 
-		// Add to key order queue
-		c.keyOrder = append(c.keyOrder, entry.Key)
+		// Set last access time to current time (keys loaded from snapshot are considered recently accessed)
+		c.lastAccess[entry.Key] = now
 	}
 
 	return true, nil
